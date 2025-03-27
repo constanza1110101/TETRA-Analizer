@@ -1,0 +1,631 @@
+use clap::{App, Arg};
+use rtlsdr::RtlSdr;
+use rustfft::FFTplanner;
+use num_complex::Complex;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::fs::File;
+use std::io::prelude::*;
+use chrono::Local;
+use serde::{Serialize, Deserialize};
+use serde_json;
+use plotters::prelude::*;
+use sqlite::{Connection, State};
+
+const SAMPLE_RATE: u32 = 2_000_000;
+const BUFFER_SIZE: usize = 16384;
+const DB_PATH: &str = "tetra_analyzer.db";
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Signal {
+    frequency: f64,
+    power: f64,
+    bandwidth: f64,
+    timestamp: String,
+    classification: String,
+    modulation: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ScanResult {
+    start_freq: f64,
+    end_freq: f64,
+    step_size: f64,
+    signals: Vec<Signal>,
+    scan_time: f64,
+    device_info: String,
+}
+
+struct TetraAnalyzer {
+    device: RtlSdr,
+    center_freq: u32,
+    gain: i32,
+    db_conn: Connection,
+    fft_planner: FFTplanner<f32>,
+    running: Arc<Mutex<bool>>,
+    signals: Arc<Mutex<Vec<Signal>>>,
+}
+
+impl TetraAnalyzer {
+    fn new(device_index: u32, center_freq: u32, gain: i32) -> Result<Self, Box<dyn std::error::Error>> {
+        // Initialize RTL-SDR device
+        let mut device = RtlSdr::open(device_index)?;
+        device.set_center_freq(center_freq)?;
+        device.set_sample_rate(SAMPLE_RATE)?;
+        device.set_tuner_gain(gain)?;
+        device.reset_buffer()?;
+        
+        // Initialize database
+        let db_conn = sqlite::open(DB_PATH)?;
+        
+        // Create tables if they don't exist
+        db_conn.execute(
+            "CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frequency REAL,
+                power REAL,
+                bandwidth REAL,
+                timestamp TEXT,
+                classification TEXT,
+                modulation TEXT
+            )"
+        )?;
+        
+        Ok(TetraAnalyzer {
+            device,
+            center_freq,
+            gain,
+            db_conn,
+            fft_planner: FFTplanner::new(false),
+            running: Arc::new(Mutex::new(true)),
+            signals: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+    
+    fn scan_band(&mut self, start_freq: u32, end_freq: u32, step_size: u32) -> Result<ScanResult, Box<dyn std::error::Error>> {
+        println!("Iniciando escaneo de banda desde {} MHz hasta {} MHz", 
+                 start_freq as f64 / 1_000_000.0, 
+                 end_freq as f64 / 1_000_000.0);
+        
+        let start_time = Instant::now();
+        let mut current_freq = start_freq;
+        let mut detected_signals = Vec::new();
+        
+        while current_freq <= end_freq {
+            println!("Escaneando {} MHz...", current_freq as f64 / 1_000_000.0);
+            
+            // Set center frequency
+            self.device.set_center_freq(current_freq)?;
+            thread::sleep(Duration::from_millis(50)); // Allow tuner to settle
+            
+            // Sample data
+            let mut buffer = vec![0u8; BUFFER_SIZE * 2];
+            self.device.read_sync(&mut buffer, BUFFER_SIZE)?;
+            
+            // Convert to complex samples
+            let mut samples: Vec<Complex<f32>> = buffer
+                .chunks_exact(2)
+                .map(|chunk| {
+                    Complex::new(
+                        (chunk[0] as f32 - 127.5) / 127.5,
+                        (chunk[1] as f32 - 127.5) / 127.5,
+                    )
+                })
+                .collect();
+            
+            // Perform FFT
+            let fft = self.fft_planner.plan_fft(samples.len());
+            fft.process(&mut samples);
+            
+            // Analyze spectrum for signals
+            let signals = self.analyze_spectrum(&samples, current_freq)?;
+            
+            // Add detected signals
+            for signal in signals {
+                detected_signals.push(signal);
+            }
+            
+            current_freq += step_size;
+        }
+        
+        let scan_time = start_time.elapsed().as_secs_f64();
+        
+        // Get device info
+        let device_info = format!(
+            "RTL-SDR device index: {}, gain: {}",
+            0, // Assuming device index 0
+            self.gain
+        );
+        
+        // Create scan result
+        let result = ScanResult {
+            start_freq: start_freq as f64,
+            end_freq: end_freq as f64,
+            step_size: step_size as f64,
+            signals: detected_signals.clone(),
+            scan_time,
+            device_info,
+        };
+        
+        // Save to database
+        for signal in &detected_signals {
+            self.save_signal_to_db(signal)?;
+        }
+        
+        // Export results as JSON
+        self.export_json(&result)?;
+        
+        // Generate spectrum plot
+        self.generate_spectrum_plot(&detected_signals)?;
+        
+        println!("Escaneo completado. {} señales detectadas en {:.2} segundos", 
+                 detected_signals.len(), scan_time);
+        
+        Ok(result)
+    }
+    
+    fn analyze_spectrum(&self, samples: &[Complex<f32>], center_freq: u32) -> Result<Vec<Signal>, Box<dyn std::error::Error>> {
+        let mut signals = Vec::new();
+        let freq_resolution = SAMPLE_RATE as f64 / samples.len() as f64;
+        
+        // Calculate power spectrum
+        let power_spectrum: Vec<f64> = samples
+            .iter()
+            .map(|sample| (sample.norm_sqr() as f64).log10() * 10.0)
+            .collect();
+        
+        // Find peaks in spectrum
+        let mut peaks = Vec::new();
+        for i in 1..power_spectrum.len() - 1 {
+            if power_spectrum[i] > power_spectrum[i-1] && 
+               power_spectrum[i] > power_spectrum[i+1] &&
+               power_spectrum[i] > -40.0 { // Threshold
+                peaks.push(i);
+            }
+        }
+        
+        // Analyze each peak
+        for peak_idx in peaks {
+            // Calculate frequency
+            let freq_offset = (peak_idx as f64 - samples.len() as f64 / 2.0) * freq_resolution;
+            let frequency = center_freq as f64 + freq_offset;
+            
+            // Estimate bandwidth
+            let bandwidth = self.estimate_bandwidth(&power_spectrum, peak_idx, freq_resolution);
+            
+            // Estimate power
+            let power = power_spectrum[peak_idx];
+            
+            // Classify signal
+            let classification = self.classify_signal(frequency, bandwidth, power);
+            
+            // Determine modulation
+            let modulation = self.estimate_modulation(&samples, peak_idx);
+            
+            // Create signal object
+            let signal = Signal {
+                frequency,
+                power,
+                bandwidth,
+                timestamp: Local::now().to_rfc3339(),
+                classification,
+                modulation,
+            };
+            
+            signals.push(signal);
+        }
+        
+        Ok(signals)
+    }
+    
+    fn estimate_bandwidth(&self, power_spectrum: &[f64], peak_idx: usize, freq_resolution: f64) -> f64 {
+        let threshold = power_spectrum[peak_idx] - 3.0; // 3dB bandwidth
+        
+        // Find lower bound
+        let mut lower_bound = peak_idx;
+        while lower_bound > 0 && power_spectrum[lower_bound] > threshold {
+            lower_bound -= 1;
+        }
+        
+        // Find upper bound
+        let mut upper_bound = peak_idx;
+        while upper_bound < power_spectrum.len() - 1 && power_spectrum[upper_bound] > threshold {
+            upper_bound += 1;
+        }
+        
+        // Calculate bandwidth
+        let bandwidth = (upper_bound - lower_bound) as f64 * freq_resolution;
+        
+        bandwidth
+    }
+    
+    fn classify_signal(&self, frequency: f64, bandwidth: f64, power: f64) -> String {
+        // Simple classification based on frequency and bandwidth
+        if (380e6..=400e6).contains(&(frequency as u64)) && (10e3..=30e3).contains(&(bandwidth as u64)) {
+            return "TETRA".to_string();
+        } else if (410e6..=430e6).contains(&(frequency as u64)) {
+            return "DMR/TETRA".to_string();
+        } else if (450e6..=470e6).contains(&(frequency as u64)) {
+            return "PMR/DMR".to_string();
+        }
+        
+        "Unknown".to_string()
+    }
+    
+    fn estimate_modulation(&self, samples: &[Complex<f32>], peak_idx: usize) -> String {
+        // Simple modulation estimation
+        // In a real implementation, this would be more sophisticated
+        
+        // Calculate amplitude variation
+        let amplitudes: Vec<f32> = samples.iter().map(|s| s.norm()).collect();
+        let amp_variance = variance(&amplitudes);
+        
+        // Calculate phase variation
+        let phases: Vec<f32> = samples.iter().map(|s| s.arg()).collect();
+        let phase_variance = variance(&phases);
+        
+        if amp_variance > 0.5 && phase_variance < 0.2 {
+            return "ASK".to_string();
+        } else if amp_variance < 0.2 && phase_variance > 0.5 {
+            return "PSK".to_string();
+        } else if amp_variance > 0.3 && phase_variance > 0.3 {
+            return "QAM".to_string();
+        } else if amp_variance < 0.2 && phase_variance < 0.2 {
+            return "FM/PM".to_string();
+        }
+        
+        "Unknown".to_string()
+    }
+    
+    fn save_signal_to_db(&self, signal: &Signal) -> Result<(), Box<dyn std::error::Error>> {
+        let query = format!(
+            "INSERT INTO signals (frequency, power, bandwidth, timestamp, classification, modulation) 
+             VALUES ({}, {}, {}, '{}', '{}', '{}')",
+            signal.frequency,
+            signal.power,
+            signal.bandwidth,
+            signal.timestamp,
+            signal.classification,
+            signal.modulation
+        );
+        
+        self.db_conn.execute(&query)?;
+        
+        Ok(())
+    }
+    
+    fn export_json(&self, result: &ScanResult) -> Result<(), Box<dyn std::error::Error>> {
+        let filename = format!("tetra_scan_{}.json", 
+                              Local::now().format("%Y%m%d_%H%M%S"));
+        
+        let mut file = File::create(filename.clone())?;
+        let json = serde_json::to_string_pretty(result)?;
+        file.write_all(json.as_bytes())?;
+        
+        println!("Resultados exportados a {}", filename);
+        
+        Ok(())
+    }
+    
+    fn generate_spectrum_plot(&self, signals: &[Signal]) -> Result<(), Box<dyn std::error::Error>> {
+        let filename = format!("spectrum_plot_{}.png", 
+                              Local::now().format("%Y%m%d_%H%M%S"));
+        
+        let root = BitMapBackend::new(&filename, (800, 600)).into_drawing_area();
+        root.fill(&WHITE)?;
+        
+        let min_freq = signals.iter().map(|s| s.frequency).fold(f64::INFINITY, f64::min) - 1e6;
+        let max_freq = signals.iter().map(|s| s.frequency).fold(f64::NEG_INFINITY, f64::max) + 1e6;
+        
+        let min_power = signals.iter().map(|s| s.power).fold(f64::INFINITY, f64::min) - 10.0;
+        let max_power = signals.iter().map(|s| s.power).fold(f64::NEG_INFINITY, f64::max) + 10.0;
+        
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Espectro de Señales Detectadas", ("sans-serif", 30).into_font())
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                (min_freq / 1e6)..(max_freq / 1e6),
+                min_power..max_power
+            )?;
+        
+        chart.configure_mesh()
+            .x_desc("Frecuencia (MHz)")
+            .y_desc("Potencia (dB)")
+            .draw()?;
+        
+        // Plot signals
+        for signal in signals {
+            let x = signal.frequency / 1e6;
+            let y = signal.power;
+            
+            // Draw point
+            chart.draw_series(PointSeries::of_element(
+                vec![(x, y)],
+                5,
+                &RED,
+                &|c, s, st| {
+                    EmptyElement::at(c)
+                        + Circle::new((0, 0), s, st.filled())
+                        + Text::new(
+                            format!("{} - {:.3} MHz", signal.classification, x),
+                            (10, 0),
+                            ("sans-serif", 12).into_font(),
+                        )
+                },
+            ))?;
+        }
+        
+        root.present()?;
+        println!("Gráfico generado: {}", filename);
+        
+        Ok(())
+    }
+    
+    fn monitor_frequency(&mut self, frequency: u32, duration: u64) -> Result<(), Box<dyn std::error::Error>> {
+        println!("Monitoreando frecuencia {} MHz durante {} segundos", 
+                 frequency as f64 / 1_000_000.0, duration);
+        
+        // Set center frequency
+        self.device.set_center_freq(frequency)?;
+        thread::sleep(Duration::from_millis(50)); // Allow tuner to settle
+        
+        let running = self.running.clone();
+        let signals = self.signals.clone();
+        
+        // Create spectral history for waterfall display
+        let mut spectral_history = Vec::new();
+        
+        let start_time = Instant::now();
+        
+        while *running.lock().unwrap() && start_time.elapsed().as_secs() < duration {
+            // Sample data
+            let mut buffer = vec![0u8; BUFFER_SIZE * 2];
+            self.device.read_sync(&mut buffer, BUFFER_SIZE)?;
+            
+            // Convert to complex samples
+            let mut samples: Vec<Complex<f32>> = buffer
+                .chunks_exact(2)
+                .map(|chunk| {
+                    Complex::new(
+                        (chunk[0] as f32 - 127.5) / 127.5,
+                        (chunk[1] as f32 - 127.5) / 127.5,
+                    )
+                })
+                .collect();
+            
+            // Perform FFT
+            let fft = self.fft_planner.plan_fft(samples.len());
+            fft.process(&mut samples);
+            
+            // Calculate power spectrum
+            let power_spectrum: Vec<f64> = samples
+                .iter()
+                .map(|sample| (sample.norm_sqr() as f64).log10() * 10.0)
+                .collect();
+            
+            // Add to spectral history
+            spectral_history.push(power_spectrum.clone());
+            if spectral_history.len() > 100 {
+                spectral_history.remove(0);
+            }
+            
+            // Analyze for TETRA patterns
+            if self.detect_tetra_pattern(&samples) {
+                println!("¡Patrón TETRA detectado en {} MHz!", frequency as f64 / 1_000_000.0);
+                
+                // Create signal
+                let signal = Signal {
+                    frequency: frequency as f64,
+                    power: power_spectrum.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                    bandwidth: 25000.0, // Typical TETRA bandwidth
+                    timestamp: Local::now().to_rfc3339(),
+                    classification: "TETRA".to_string(),
+                    modulation: "π/4-DQPSK".to_string(), // TETRA uses π/4-DQPSK
+                };
+                
+                // Save to database
+                self.save_signal_to_db(&signal)?;
+                
+                // Add to signals list
+                signals.lock().unwrap().push(signal);
+            }
+            
+            // Sleep briefly to reduce CPU usage
+            thread::sleep(Duration::from_millis(10));
+        }
+        
+        // Generate waterfall plot
+        self.generate_waterfall_plot(&spectral_history, frequency)?;
+        
+        println!("Monitoreo completado");
+        
+        Ok(())
+    }
+    
+    fn detect_tetra_pattern(&self, samples: &[Complex<f32>]) -> bool {
+        // In a real implementation, this would perform correlation with TETRA synchronization patterns
+        // This is a simplified placeholder
+        
+        // Calculate autocorrelation
+        let mut autocorr = vec![0.0; samples.len() / 2];
+        for i in 0..autocorr.len() {
+            for j in 0..autocorr.len() {
+                autocorr[i] += (samples[j] * samples[j + i].conj()).norm();
+            }
+        }
+        
+        // Look for peaks at TETRA frame intervals (TDMA structure)
+        // TETRA frame is 56.67 ms (4 timeslots)
+        let frame_samples = (56.67e-3 * SAMPLE_RATE as f64) as usize;
+        
+        // Check if there are peaks at frame intervals
+        let mut peaks = Vec::new();
+        for i in 1..autocorr.len() - 1 {
+            if autocorr[i] > autocorr[i-1] && autocorr[i] > autocorr[i+1] {
+                peaks.push(i);
+            }
+        }
+        
+        // Check if peaks match TETRA frame structure
+        for i in 0..peaks.len() - 1 {
+            if (peaks[i+1] - peaks[i]).abs_diff(frame_samples) < frame_samples / 10 {
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    fn generate_waterfall_plot(&self, spectral_history: &[Vec<f64>], center_freq: u32) -> Result<(), Box<dyn std::error::Error>> {
+        let filename = format!("waterfall_{}MHz_{}.png", 
+                              center_freq as f64 / 1_000_000.0,
+                              Local::now().format("%Y%m%d_%H%M%S"));
+        
+        let root = BitMapBackend::new(&filename, (800, 600)).into_drawing_area();
+        root.fill(&WHITE)?;
+        
+        let freq_range = SAMPLE_RATE as f64;
+        let min_freq = center_freq as f64 - freq_range / 2.0;
+        let max_freq = center_freq as f64 + freq_range / 2.0;
+        
+        let mut chart = ChartBuilder::on(&root)
+            .caption(format!("Espectrograma - {} MHz", center_freq as f64 / 1_000_000.0), ("sans-serif", 30).into_font())
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                (min_freq / 1e6)..(max_freq / 1e6),
+                0..spectral_history.len()
+            )?;
+        
+        chart.configure_mesh()
+            .x_desc("Frecuencia (MHz)")
+            .y_desc("Tiempo (más reciente abajo)")
+            .draw()?;
+        
+        // Create heatmap
+        let mut data = Vec::new();
+        for (y, spectrum) in spectral_history.iter().enumerate() {
+            for (x, power) in spectrum.iter().enumerate() {
+                let freq = min_freq + (x as f64 / spectrum.len() as f64) * freq_range;
+                data.push((freq / 1e6, y, *power));
+            }
+        }
+        
+        // Define color gradient
+        let grad = colorous::VIRIDIS;
+        
+        // Plot heatmap
+        chart.draw_series(
+            data.iter().map(|&(x, y, z)| {
+                let color_scale = (z + 80.0) / 60.0; // Normalize -80 to -20 dB to 0-1
+                let color_scale = color_scale.max(0.0).min(1.0);
+                let color = grad.eval_continuous(color_scale);
+                Rectangle::new(
+                    [(x, y), (x + freq_range / 1e6 / spectral_history[0].len() as f64, y + 1)],
+                    RGBColor(color.r, color.g, color.b).filled(),
+                )
+            })
+        )?;
+        
+        root.present()?;
+        println!("Espectrograma generado: {}", filename);
+        
+        Ok(())
+    }
+}
+
+fn variance(data: &[f32]) -> f32 {
+    let mean = data.iter().sum::<f32>() / data.len() as f32;
+    let variance = data.iter()
+        .map(|&x| (x - mean).powi(2))
+        .sum::<f32>() / data.len() as f32;
+    variance
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let matches = App::new("TETRA Analyzer")
+        .version("1.0")
+        .author("Developed for educational purposes")
+        .about("A Rust-based TETRA signal analyzer for educational and research purposes")
+        .arg(Arg::with_name("scan")
+            .short("s")
+            .long("scan")
+            .help("Scan frequency band"))
+        .arg(Arg::with_name("monitor")
+            .short("m")
+            .long("monitor")
+            .help("Monitor specific frequency"))
+        .arg(Arg::with_name("start")
+            .long("start")
+            .takes_value(true)
+            .help("Start frequency in MHz (default: 380)"))
+        .arg(Arg::with_name("end")
+            .long("end")
+            .takes_value(true)
+            .help("End frequency in MHz (default: 400)"))
+        .arg(Arg::with_name("step")
+            .long("step")
+            .takes_value(true)
+            .help("Step size in kHz (default: 25)"))
+        .arg(Arg::with_name("frequency")
+            .short("f")
+            .long("frequency")
+            .takes_value(true)
+            .help("Frequency to monitor in MHz"))
+        .arg(Arg::with_name("duration")
+            .short("d")
+            .long("duration")
+            .takes_value(true)
+            .help("Monitoring duration in seconds (default: 60)"))
+        .arg(Arg::with_name("gain")
+            .short("g")
+            .long("gain")
+            .takes_value(true)
+            .help("Gain in dB (default: 30)"))
+        .get_matches();
+    
+    // Parse arguments
+    let start_freq = matches.value_of("start")
+        .map(|s| (s.parse::<f64>().unwrap() * 1_000_000.0) as u32)
+        .unwrap_or(380_000_000);
+    
+    let end_freq = matches.value_of("end")
+        .map(|s| (s.parse::<f64>().unwrap() * 1_000_000.0) as u32)
+        .unwrap_or(400_000_000);
+    
+    let step_size = matches.value_of("step")
+        .map(|s| (s.parse::<f64>().unwrap() * 1_000.0) as u32)
+        .unwrap_or(25_000);
+    
+    let freq = matches.value_of("frequency")
+        .map(|s| (s.parse::<f64>().unwrap() * 1_000_000.0) as u32)
+        .unwrap_or(395_000_000);
+    
+    let duration = matches.value_of("duration")
+        .map(|s| s.parse::<u64>().unwrap())
+        .unwrap_or(60);
+    
+    let gain = matches.value_of("gain")
+        .map(|s| s.parse::<i32>().unwrap())
+        .unwrap_or(30);
+    
+    // Initialize analyzer
+    let mut analyzer = TetraAnalyzer::new(0, freq, gain)?;
+    
+    println!("TETRA Analyzer - SOLO PARA USO EDUCATIVO E INVESTIGACIÓN");
+    println!("--------------------------------------------------------");
+    
+    if matches.is_present("scan") {
+        analyzer.scan_band(start_freq, end_freq, step_size)?;
+    } else if matches.is_present("monitor") {
+        analyzer.monitor_frequency(freq, duration)?;
+    } else {
+        println!("Debe especificar --scan o --monitor. Use --help para más información.");
+    }
+    
+    Ok(())
+}
