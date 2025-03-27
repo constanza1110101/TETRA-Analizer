@@ -2,7 +2,7 @@ TETRA Analyzer
 Herramienta avanzada para análisis de señales TETRA en Rust
 SOLO PARA USO EDUCATIVO E INVESTIGACIÓN LEGAL
 
-TETRA Analyzer Banner
+TETRA Analyzer
 
 Descripción
 TETRA Analyzer es una herramienta de análisis de radiofrecuencia implementada en Rust, especializada en la detección, monitorización y análisis de señales TETRA (Terrestrial Trunked Radio). Esta herramienta de alto rendimiento aprovecha la velocidad y seguridad de memoria de Rust para proporcionar análisis en tiempo real de señales digitales profesionales.
